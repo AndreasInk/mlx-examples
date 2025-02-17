@@ -3,7 +3,8 @@ import json
 import math
 import time
 from pathlib import Path
-
+import pandas as pd
+from sklearn.model_selection import train_test_split
 import mlx.core as mx
 import mlx.nn as nn
 import mlx.optimizers as optim
@@ -26,8 +27,6 @@ from models.audio import (
     pad_or_trim,
 )
 
-# Huggingface datasets
-from datasets import load_dataset
 
 # Configure typealias for batched inputs
 from collections import namedtuple
@@ -163,17 +162,55 @@ def load(args):
 
     print(f"Loading dataset {hf_dataset}, {hf_dataset_lang} from hugging face")
     # todo: whisper-lora: select only necessary columns audio, sentence using dataset.select_columns
-
-    dataset = load_dataset(
-        hf_dataset,
-        hf_dataset_lang,
-        # todo: whisper-lora: consider including `streaming=True,` for large datasets
-        # streaming=True,
-        trust_remote_code=True,
-    )
-    dataset = dataset.select_columns(["path", "sentence"])
-    dataset = dataset.flatten()
-    train, valid, test = dataset["train"], dataset["validation"], dataset["test"]
+    
+    """
+    Load a CSV dataset and split it into training, validation, and test sets.
+    
+    The CSV is expected to have the following columns:
+        - filename: the path to the audio file (e.g., "Add a medication for sinemet.m4a")
+        - reference: the ground truth transcription.
+        - whisper: transcription from Whisper (optional).
+        - apple_speech: transcription from Apple Speech (optional).
+    
+    This function renames 'filename' to 'path' and 'reference' to 'sentence'
+    so that it is compatible with the rest of the code.
+    
+    Parameters:
+        csv_path (str): Path to the CSV file.
+        seed (int): Random seed for reproducible splits.
+        test_size (float): Fraction of data to reserve for testing.
+        valid_size (float): Fraction of data (from the remaining data) to reserve for validation.
+        
+    Returns:
+        tuple: (train, valid, test) where each is a dict with keys 'path' and 'sentence' 
+            and values as lists.
+    """
+    test_size=0.1
+    valid_size=0.1
+    seed = 42
+    # Read the CSV file into a DataFrame
+    df = pd.read_csv("/Users/andreas/Desktop/Whisper+PD/merged_si.csv")
+    
+    # Rename columns to match expected names in your training code
+    df = df.rename(columns={"filename": "path", "reference": "sentence"})
+    
+    # Shuffle the DataFrame using the provided seed for reproducibility
+    df = df.sample(frac=1, random_state=42).reset_index(drop=True)
+    
+    # First, split off the test set
+    train_val_df, test_df = train_test_split(df, test_size=test_size, random_state=seed)
+    
+    # Next, split the remaining data into training and validation sets.
+    # Calculate validation fraction relative to the remaining train_val data.
+    valid_relative_size = valid_size / (1 - test_size)
+    train_df, valid_df = train_test_split(train_val_df, test_size=valid_relative_size, random_state=seed)
+    
+    # Convert the DataFrames to dictionaries with lists so that they are compatible
+    # with your iterate_batches function (which accesses dset["path"] and dset["sentence"])
+    train = train_df.to_dict(orient="list")
+    valid = valid_df.to_dict(orient="list")
+    test = test_df.to_dict(orient="list")
+    
     if args.train and len(train) == 0:
         raise ValueError(
             "Training set not found or empty. Must provide training set for fine-tuning."
@@ -190,59 +227,62 @@ def load(args):
 
 
 def iterate_batches(dset, tokenizer, batch_size, train=False):
-    # Shuffle indices
+    # Instead of computing target_frames dynamically, use the fixed expected frame count.
+    target_frames = N_FRAMES  # use the constant expected by the model
+
     while True:
-        indices = np.arange(len(dset))
+        # Shuffle indices if training
+        indices = np.arange(len(dset["path"]))
         if train:
             indices = np.random.permutation(indices)
 
-        # Collect batches from dataset
+        # Collect batches from the dataset
         for i in range(0, len(indices) - batch_size + 1, batch_size):
-            # Encode batch
+            # Get file paths for the current batch
             paths = [dset["path"][indices[i + j]] for j in range(batch_size)]
+            # Process each audio sample and ensure it has the expected number of frames.
             batch_audio = [
                 pad_or_trim(
-                    log_mel_spectrogram(path, padding=N_SAMPLES), N_FRAMES, axis=-2
+                    log_mel_spectrogram(path, padding=N_SAMPLES),
+                    target_frames,  # now always N_FRAMES
+                    axis=-2,
                 ).astype(mx.float32)
                 for path in paths
             ]
+            # Encode sentences using the tokenizer
             batch_sentence = [
                 tokenizer.encode(dset["sentence"][indices[i + j]])
                 for j in range(batch_size)
             ]
-            assert len(batch_sentence) == len(
-                batch_audio
-            ), "unequal batches of text & audio lengths"
+            assert len(batch_sentence) == len(batch_audio), "unequal batches of text & audio lengths"
+
+            # Compute shapes for each processed audio sample and token list lengths
             shapes_audio = [x.shape for x in batch_audio]
             lengths_sentence = [len(x) for x in batch_sentence]
 
-            # Check if any sequence is longer than 2048 tokens
-            if max(lengths_sentence) > 2048 or max(shapes_audio)[0] > 3000:
+            # Warn if any sequence exceeds typical limits
+            if max(lengths_sentence) > 2048 or max(shapes_audio)[0] > target_frames:
                 print(
-                    "[WARNING] Some sequences are longer than 2048 tokens and/or longer than 3000 samples. "
+                    "[WARNING] Some sequences are longer than 2048 tokens and/or longer than the expected frame count. "
                     "Consider pre-splitting your data to save memory."
                 )
 
-            # Pad to the max length
+            # Pad text sequences to the maximum sentence length in the batch
             batch_arr_sentence = np.zeros((batch_size, max(lengths_sentence)), np.int32)
-            batch_arr_audio = np.zeros(([batch_size] + max(shapes_audio)), np.float32)
+            # Pad audio sequences to the maximum shape in the batch.
+            batch_arr_audio = np.zeros((batch_size,) + max(shapes_audio), np.float32)
 
+            # Fill the padded arrays with the actual sentence data
             for j in range(batch_size):
-                batch_arr_sentence[j, : lengths_sentence[j]] = batch_sentence[j]
-            batch_sentence = mx.array(
-                batch_arr_sentence
-            )  # batch_sentence.shape == (1, 31)
+                batch_arr_sentence[j, :lengths_sentence[j]] = batch_sentence[j]
+            batch_sentence = mx.array(batch_arr_sentence)
 
+            # Fill the padded arrays with the actual audio data
             for j in range(batch_size):
-                batch_arr_audio[j, : shapes_audio[j][0], : shapes_audio[j][1]] = (
-                    batch_audio[j]
-                )
-            batch_audio = mx.array(
-                batch_arr_audio
-            )  # batch_audio.shape == (1, 3000, 80)
+                batch_arr_audio[j, :shapes_audio[j][0], :shapes_audio[j][1]] = batch_audio[j]
+            batch_audio = mx.array(batch_arr_audio)
 
-            # whisper-lora developer note: In the original LLM LoRA impl, we're sending (inputs, targets) as (batch_sentence[:, :-1], batch_sentence[:, 1:]) respectively
-            # in the Whisper case, however, we'll need to send audio as inputs, and the sentence tokens as targets
+            # Yield the batch as a named tuple
             yield BatchInput(audio=batch_audio, sentence=batch_sentence)
 
         if not train:
@@ -264,21 +304,28 @@ def evaluate(model, dataset, loss, tokenizer, batch_size, num_batches):
 
 
 def loss(model, mels, tokens):
-    # Run model on inputs
-    logits = model(mels, tokens)
+    # Run model on inputs to get logits
+    logits = model(mels, tokens)  # logits shape: (batch, seq_length, vocab_size)
     logits = logits.astype(mx.float32)
 
-    # Mask padding tokens
-    # todo: whisper-lora: is `length_mask = mx.arange(mels.shape[1])[None, :] < lengths[:, None]` necessary?
+    # Determine mask based on non-padding tokens.
+    # Here we assume that the padding token ID is 0.
+    # Adjust pad_token_id if needed.
+    pad_token_id = 0
+    # Create mask: 1 where token != pad_token_id, 0 otherwise.
+    mask = (tokens != pad_token_id).astype(mx.float32)
 
-    # Calculate the loss
-    # todo: whisper-lora: is `ce = nn.losses.cross_entropy(logits, tokens) * length_mask` necessary?
-    # ntoks = length_mask.sum()
+    # Compute cross-entropy loss per token without reduction
+    ce = nn.losses.cross_entropy(logits, tokens, reduction='none')
+    # Multiply by the mask so that padded positions don't contribute.
+    ce = ce * mask
+    # Compute the total number of valid tokens
+    ntoks = mask.sum()
+    # Avoid division by zero
+    ntoks = ntoks if ntoks > 0 else 1
 
-    ce = nn.losses.cross_entropy(logits, tokens)
-    ntoks = len(tokens)
-    ce = ce.sum() / ntoks
-    return ce, ntoks
+    # Return average loss and token count
+    return ce.sum() / ntoks, ntoks
 
 
 def train(model, loss, tokenizer, args):
